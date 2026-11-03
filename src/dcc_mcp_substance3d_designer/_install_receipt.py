@@ -31,7 +31,12 @@ def _is_link_or_junction(path: Path) -> bool:
 def _payload_entries(root: Path) -> Iterable[Path]:
     if not root.exists():
         return ()
-    return tuple(path for path in root.rglob("*") if path.is_file() or _is_link_or_junction(path))
+    return tuple(
+        path
+        for path in root.rglob("*")
+        if (path.is_file() or _is_link_or_junction(path))
+        and not (path.parent.name == "__pycache__" and path.suffix == ".pyc")
+    )
 
 
 def load_and_validate_receipt(

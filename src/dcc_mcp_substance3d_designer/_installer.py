@@ -208,6 +208,11 @@ def _plugin_source(ctx: InstallContext) -> str:
     return f'''"""Generated DCC-MCP Designer plugin. Owned by its install receipt."""
 from __future__ import annotations
 
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, {json.dumps(str(ctx.python_root))})
+
 from dcc_mcp_core import capture_bootstrap_errors
 
 _CAPTURE = {{
@@ -249,13 +254,15 @@ def _launcher_payload(ctx: InstallContext, *, platform_name: Optional[str] = Non
         host = _batch_literal(str(ctx.host_path))
         plugins = _batch_literal(plugin_root)
         site_packages = _batch_literal(python_root)
+        designer_python_path = f"{site_packages};{plugins}"
         content = (
             "@echo off\r\n"
             "setlocal DisableDelayedExpansion\r\n"
+            "set \"PYTHONDONTWRITEBYTECODE=1\"\r\n"
             "if defined SBS_DESIGNER_PYTHON_PATH (\r\n"
-            f'  set "SBS_DESIGNER_PYTHON_PATH=%SBS_DESIGNER_PYTHON_PATH%;{plugins}"\r\n'
+            f'  set "SBS_DESIGNER_PYTHON_PATH=%SBS_DESIGNER_PYTHON_PATH%;{designer_python_path}"\r\n'
             ") else (\r\n"
-            f'  set "SBS_DESIGNER_PYTHON_PATH={plugins}"\r\n'
+            f'  set "SBS_DESIGNER_PYTHON_PATH={designer_python_path}"\r\n'
             ")\r\n"
             "if defined PYTHONPATH (\r\n"
             f'  set "PYTHONPATH={site_packages};%PYTHONPATH%"\r\n'
@@ -269,8 +276,9 @@ def _launcher_payload(ctx: InstallContext, *, platform_name: Optional[str] = Non
             "#!/bin/sh\n"
             f"adapter_plugins={shlex.quote(plugin_root)}\n"
             f"python_root={shlex.quote(python_root)}\n"
+            "export PYTHONDONTWRITEBYTECODE=1\n"
             'SBS_DESIGNER_PYTHON_PATH="${SBS_DESIGNER_PYTHON_PATH:+${SBS_DESIGNER_PYTHON_PATH}:}'
-            '${adapter_plugins}"\n'
+            '${python_root}:${adapter_plugins}"\n'
             'PYTHONPATH="${python_root}${PYTHONPATH:+:${PYTHONPATH}}"\n'
             "export SBS_DESIGNER_PYTHON_PATH PYTHONPATH\n"
             f'exec {shlex.quote(str(ctx.host_path))} "$@"\n'

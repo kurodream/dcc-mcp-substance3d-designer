@@ -255,6 +255,15 @@ def test_install_stages_a_receipted_launcher_and_uninstall_consumes_only_the_rec
     launcher_text = launcher.read_text(encoding="utf-8")
     assert "SBS_DESIGNER_PYTHON_PATH" in launcher_text
     assert "PYTHONPATH" in launcher_text
+    assert "PYTHONDONTWRITEBYTECODE=1" in launcher_text
+    site_packages = Path(common[common.index("--python") + 1]).parent.parent / "Lib" / "site-packages"
+    sbs_path_lines = [line for line in launcher_text.splitlines() if "SBS_DESIGNER_PYTHON_PATH=" in line]
+    assert any(str(site_packages) in line for line in sbs_path_lines)
+    plugin = next(path for path in owned_paths if path.name == "dcc_mcp_substance3d_designer_plugin.py")
+    plugin_text = plugin.read_text(encoding="utf-8")
+    assert "sys.dont_write_bytecode = True" in plugin_text
+    assert "sys.path.insert(0" in plugin_text
+    assert "site-packages" in plugin_text
 
     assert main(["uninstall", *common]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "planned"
@@ -273,11 +282,6 @@ def test_install_stages_a_receipted_launcher_and_uninstall_consumes_only_the_rec
 def test_status_reports_repair_and_reinstall_converges(tmp_path, monkeypatch, capsys):
     host = _synthetic_designer(tmp_path)
     install_root = tmp_path / "install-root"
-    inherited = os.environ.get("PYTHONPATH", "")
-    monkeypatch.setenv(
-        "PYTHONPATH",
-        os.pathsep.join(part for part in (str(ROOT / "src"), inherited) if part),
-    )
     monkeypatch.setenv("DCC_MCP_SUBSTANCE3D_DESIGNER_INSTALL_ROOT", str(install_root))
     monkeypatch.setenv("DCC_MCP_REGISTRY_DIR", str(tmp_path / "registry"))
     monkeypatch.setenv("DCC_MCP_INSTALL_VERIFY_TIMEOUT", "0.01")
@@ -494,6 +498,11 @@ def test_verify_proves_direct_usability_with_a_typed_designer_probe(tmp_path, mo
     monkeypatch.setenv("DCC_MCP_INSTALL_VERIFY_TIMEOUT", "10")
 
     runtime = _require_typed_test_runtime(sys.executable)
+    import dcc_mcp_substance3d_designer as adapter
+
+    # Pytest imports the source tree, while the lifecycle contract models the
+    # normal wheel install selected by the embedded interpreter.
+    adapter.__file__ = runtime["adapter_file"]
 
     color_engine = types.SimpleNamespace(
         getName=lambda: "legacy",
@@ -745,7 +754,7 @@ def test_posix_launcher_preserves_existing_paths_when_owned_paths_contain_spaces
 
     assert "adapter_plugins='/tmp/root with spaces/payload/plugins'" in launcher
     assert "python_root='/tmp/python with spaces/site-packages'" in launcher
-    assert '${SBS_DESIGNER_PYTHON_PATH}:}${adapter_plugins}"' in launcher
+    assert '${SBS_DESIGNER_PYTHON_PATH}:}${python_root}:${adapter_plugins}"' in launcher
     assert 'PYTHONPATH="${python_root}${PYTHONPATH:+:${PYTHONPATH}}"' in launcher
     assert "exec '/opt/Adobe Designer/Designer' \"$@\"" in launcher
 
