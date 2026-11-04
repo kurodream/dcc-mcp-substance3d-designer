@@ -425,7 +425,7 @@ tools:
       - {position: 1, color: [0.78, 0.52, 0.41, 1], midpoint: 0.5}
     note: Replace the IDs with the native IDs returned by inspection.
 - name: get_parameter
-  description: Read one explicit input parameter from an identified node.
+  description: Read one explicit input parameter and its inheritance method from an identified node.
   input_schema:
     type: object
     additionalProperties: false
@@ -462,6 +462,57 @@ tools:
         type: object
   annotations:
     read_only_hint: true
+    destructive_hint: false
+    idempotent_hint: true
+- name: set_property_inheritance
+  description: Set Absolute, RelativeToParent, or RelativeToInput on one node input such as $pixelsize.
+  input_schema:
+    type: object
+    additionalProperties: false
+    required:
+    - node_id
+    - parameter
+    - method
+    properties:
+      node_id:
+        type: string
+        pattern: ^[A-Za-z0-9_-]+$
+        maxLength: 128
+      parameter:
+        type: string
+        pattern: ^[$]?[A-Za-z][A-Za-z0-9_.-]*$
+        maxLength: 128
+      method:
+        type: string
+        enum:
+        - Absolute
+        - RelativeToParent
+        - RelativeToInput
+      expected_graph_uid:
+        type: string
+        minLength: 1
+        maxLength: 128
+  read_only: false
+  destructive: false
+  idempotent: true
+  execution: sync
+  affinity: main
+  timeout_hint_secs: 30
+  source_file: scripts/set_property_inheritance.py
+  output_schema:
+    type: object
+    required:
+    - success
+    - message
+    properties:
+      success:
+        type: boolean
+      message:
+        type: string
+      context:
+        type: object
+  annotations:
+    read_only_hint: false
     destructive_hint: false
     idempotent_hint: true
 - name: expose_parameter

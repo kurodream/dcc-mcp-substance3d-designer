@@ -399,9 +399,50 @@ def get_parameter(node_id: str, parameter: str) -> dict[str, Any]:
     prop = node.getPropertyFromId(identifier, SDPropertyCategory.Input)
     if prop is None:
         raise GraphAuthoringError(f"Input parameter '{identifier}' was not found", "PARAMETER_NOT_FOUND")
+    inheritance = None
+    getter = getattr(node, "getPropertyInheritanceMethod", None)
+    if callable(getter):
+        method = getter(prop)
+        inheritance = str(getattr(method, "name", method))
     return {
         "node_id": node_identifier(node),
         "parameter": identifier,
+        "value": json_value(node.getPropertyValue(prop)),
+        "inheritance": inheritance,
+    }
+
+
+def set_property_inheritance(
+    node_id: str, parameter: str, method: str, expected_graph_uid: str | None = None
+) -> dict[str, Any]:
+    """Set Absolute / RelativeToParent / RelativeToInput on one input property."""
+    from sd.api.sdproperty import SDPropertyInheritanceMethod
+
+    from .graph_inspection import checked_graph, find_in_graph, require_input
+
+    allowed = ("Absolute", "RelativeToParent", "RelativeToInput")
+    resolved = str(method).strip()
+    if resolved not in allowed:
+        raise GraphAuthoringError(
+            "method must be Absolute, RelativeToParent, or RelativeToInput", "INVALID_INHERITANCE_METHOD"
+        )
+    graph = checked_graph(expected_graph_uid)
+    node = find_in_graph(graph, node_id)
+    prop = require_input(node, parameter)
+    setter = getattr(node, "setPropertyInheritanceMethod", None)
+    if not callable(setter):
+        raise GraphAuthoringError("Property inheritance API is unavailable", "INHERITANCE_API_UNAVAILABLE")
+    setter(prop, getattr(SDPropertyInheritanceMethod, resolved))
+    observed = node.getPropertyInheritanceMethod(prop)
+    observed_name = str(getattr(observed, "name", observed))
+    if observed_name != resolved:
+        raise GraphAuthoringError(
+            "Inheritance method readback did not match the requested value", "INHERITANCE_READBACK_FAILED"
+        )
+    return {
+        "node_id": node_identifier(node),
+        "parameter": prop.getId(),
+        "inheritance": observed_name,
         "value": json_value(node.getPropertyValue(prop)),
     }
 
