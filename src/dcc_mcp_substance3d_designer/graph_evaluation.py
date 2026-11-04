@@ -21,10 +21,27 @@ def _graph_output_ids(graph: Any) -> set[str]:
     return {api.node_identifier(node) for node in api.items(graph.getOutputNodes())}
 
 
+def _pin_output_identifier(name: str, used: set[str]) -> str:
+    """Build a unique Designer output identifier for one temporary pin."""
+    base = api.require_identifier(f"mcp_pin_{name}")
+    candidate = base
+    suffix = 2
+    while candidate.casefold() in used:
+        candidate = api.require_identifier(f"{base}_{suffix}")
+        suffix += 1
+    used.add(candidate.casefold())
+    return candidate
+
+
 def _pin_intermediates_for_export(
     graph: Any, selected: list[tuple[str, Any, Any]], expected_graph_uid: str
 ) -> tuple[list[tuple[str, str, str, Any, Any]], list[str]]:
     """Pin non-output selections to temporary graph outputs so compute retains textures.
+
+    Temporary outputs must receive unique annotation identifiers. Anonymous
+    ``sbs::compositing::output`` nodes collide in Designer and make
+    ``getPropertyValue`` / ``SDTexture.save`` return the same bitmap for every
+    pin in a batch (and across later exports).
 
     Returns resolved rows ``(name, source_node_id, source_property, read_node, read_prop)``
     and created temp output node ids for rollback.
@@ -34,6 +51,12 @@ def _pin_intermediates_for_export(
     from .graph_inspection import find_in_graph
 
     output_ids = _graph_output_ids(graph)
+    identifiers = getattr(graph, "getOutputIdentifiers", None)
+    used_identifiers = {
+        str(api.json_value(item)).casefold()
+        for item in api.items(identifiers() if callable(identifiers) else None)
+        if api.json_value(item) is not None
+    }
     resolved: list[tuple[str, str, str, Any, Any]] = []
     created: list[str] = []
     try:
@@ -43,7 +66,8 @@ def _pin_intermediates_for_export(
             if source_id in output_ids:
                 resolved.append((name, source_id, source_property, node, prop))
                 continue
-            temp = api.create_node("sbs::compositing::output")
+            pin_id = _pin_output_identifier(name, used_identifiers)
+            temp = api.add_output(pin_id)
             temp_id = temp["node_id"]
             created.append(temp_id)
             api.connect_nodes(source_id, source_property, temp_id, _OUTPUT_INPUT, expected_graph_uid)
@@ -97,28 +121,28 @@ def export_native_maps(
         resolved, created = _pin_intermediates_for_export(graph, selected, expected_graph_uid)
         # Temp outputs increase node count; keep the same evaluation budget as before.
         evaluate_graph(expected_graph_uid, 128 + len(created), max_resolution)
-        textures = []
-        for name, source_id, source_property, read_node, read_prop in resolved:
-            wrapped = read_node.getPropertyValue(read_prop)
-            texture = wrapped.get() if wrapped else None
-            if texture is None:
-                raise api.GraphAuthoringError(
-                    f"Output {name} ({source_id}.{source_property}) did not compute after pinning "
-                    "a temporary graph output. Check that the source node evaluates and that "
-                    "Absolute $outputsize stays within the resolution budget.",
-                    "OUTPUT_NOT_COMPUTED",
-                )
-            size = texture.getSize()
-            if not 0 < size.x <= max_resolution or not 0 < size.y <= max_resolution:
-                raise api.GraphAuthoringError("Texture exceeds the resolution budget", "RESOLUTION_LIMIT")
-            textures.append((name, source_id, source_property, texture, size))
         destination.parent.mkdir(parents=True, exist_ok=True)
         files = []
         # Validate all files in owned storage before publishing the directory.
+        # Save each texture immediately after readback: Designer SDTexture handles
+        # can alias a shared buffer, so delaying save across the batch rewrites
+        # every PNG with the last handle's pixels.
         with tempfile.TemporaryDirectory(prefix=".designer-maps-", dir=destination.parent) as temporary:
             staging = Path(temporary) / "maps"
             staging.mkdir()
-            for name, source_id, source_property, texture, size in textures:
+            for name, source_id, source_property, read_node, read_prop in resolved:
+                wrapped = read_node.getPropertyValue(read_prop)
+                texture = wrapped.get() if wrapped else None
+                if texture is None:
+                    raise api.GraphAuthoringError(
+                        f"Output {name} ({source_id}.{source_property}) did not compute after pinning "
+                        "a temporary graph output. Check that the source node evaluates and that "
+                        "Absolute $outputsize stays within the resolution budget.",
+                        "OUTPUT_NOT_COMPUTED",
+                    )
+                size = texture.getSize()
+                if not 0 < size.x <= max_resolution or not 0 < size.y <= max_resolution:
+                    raise api.GraphAuthoringError("Texture exceeds the resolution budget", "RESOLUTION_LIMIT")
                 path = staging / (name + ".png")
                 if texture.save(str(path)) is False or not path.is_file() or not path.stat().st_size:
                     raise api.GraphAuthoringError(f"SDK did not save output {name}", "MAP_OUTPUT_MISSING")
