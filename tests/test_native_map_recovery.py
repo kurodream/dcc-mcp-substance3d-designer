@@ -43,7 +43,12 @@ def native_host(monkeypatch):
                 getProperties=lambda category, prop=prop: [prop],
             )
         )
-    graph = SimpleNamespace(getUID=lambda: "graph-A", getNodes=lambda: nodes, getOutputNodes=lambda: nodes)
+    graph = SimpleNamespace(
+        getUID=lambda: "graph-A",
+        getNodes=lambda: nodes,
+        getOutputNodes=lambda: nodes,
+        getOutputIdentifiers=lambda: ["0", "1"],
+    )
     monkeypatch.setattr(api, "active_graph", lambda: graph)
     monkeypatch.setattr(api, "remove_created", lambda created: None)
     monkeypatch.setattr(evaluation, "evaluate_graph", lambda *args: {})
@@ -147,9 +152,11 @@ def test_intermediate_node_is_pinned_then_cleaned_up(monkeypatch, tmp_path):
         getProperties=lambda category: [pin_prop],
     )
 
-    def create_node(*args, **kwargs):
+    def add_output(output_id, position=None):
+        assert output_id == "mcp_pin_warped"
+        pin.getIdentifier = lambda: output_id
         nodes.append(pin)
-        return {"node_id": "pin"}
+        return {"node_id": output_id}
 
     def connect_nodes(*args, **kwargs):
         return {"already_connected": False}
@@ -157,10 +164,11 @@ def test_intermediate_node_is_pinned_then_cleaned_up(monkeypatch, tmp_path):
     graph = SimpleNamespace(
         getUID=lambda: "graph-A",
         getNodes=lambda: nodes,
-        getOutputNodes=lambda: [node for node in nodes if node.getIdentifier() in {"out", "pin"}],
+        getOutputNodes=lambda: [node for node in nodes if node.getIdentifier() in {"out", "mcp_pin_warped"}],
+        getOutputIdentifiers=lambda: ["shape_preview"],
     )
     monkeypatch.setattr(api, "active_graph", lambda: graph)
-    monkeypatch.setattr(api, "create_node", create_node)
+    monkeypatch.setattr(api, "add_output", add_output)
     monkeypatch.setattr(api, "connect_nodes", connect_nodes)
     monkeypatch.setattr(api, "remove_created", lambda created: cleaned.extend(created))
     monkeypatch.setattr(evaluation, "evaluate_graph", lambda *args: {})
@@ -178,8 +186,94 @@ def test_intermediate_node_is_pinned_then_cleaned_up(monkeypatch, tmp_path):
     assert [item["name"] for item in result["files"]] == ["warped", "final"]
     assert result["files"][0]["node_id"] == "mid"
     assert result["files"][0]["property"] == "unique_filter_output"
-    assert cleaned == ["pin"]
-    assert "pin" not in {node.getIdentifier() for node in nodes} or cleaned == ["pin"]
+    assert cleaned == ["mcp_pin_warped"]
+
+
+def test_pinned_outputs_use_unique_identifiers_and_save_before_next_read(monkeypatch, tmp_path):
+    """Designer anonymous outputs and shared SDTexture handles must not alias exports."""
+    module = ModuleType("sd.api.sdproperty")
+    module.SDPropertyCategory = SimpleNamespace(Output="Output", Input="Input")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
+    shared = {"bytes": png_header(width=8)}
+    mid_props = [
+        SimpleNamespace(getId=lambda: "unique_filter_output"),
+        SimpleNamespace(getId=lambda: "unique_filter_output"),
+    ]
+    created_ids = []
+    cleaned = []
+
+    def texture_for(width: int):
+        def save(path):
+            # Mimic SDK handles that all write the *current* shared buffer.
+            Path(path).write_bytes(shared["bytes"])
+            return True
+
+        return SimpleNamespace(
+            getSize=lambda width=width: SimpleNamespace(x=width, y=8),
+            getPixelFormat=lambda: SimpleNamespace(name="LUM16"),
+            save=save,
+        )
+
+    nodes = []
+    for index, prop in enumerate(mid_props):
+        nodes.append(
+            SimpleNamespace(
+                getIdentifier=lambda index=index: f"mid{index}",
+                getPropertyFromId=lambda *args, prop=prop: prop,
+                getPropertyValue=lambda prop: None,
+                getProperties=lambda category, prop=prop: [prop],
+            )
+        )
+
+    pins = {}
+
+    def add_output(output_id, position=None):
+        created_ids.append(output_id)
+        pin_prop = SimpleNamespace(getId=lambda: output_id)
+        index = len(created_ids) - 1
+        width = 8 + index
+
+        def get_value(prop, index=index, width=width):
+            shared["bytes"] = png_header(width=width)
+            return SimpleNamespace(get=lambda width=width: texture_for(width))
+
+        pin = SimpleNamespace(
+            getIdentifier=lambda output_id=output_id: output_id,
+            getPropertyFromId=lambda *args, pin_prop=pin_prop: pin_prop,
+            getPropertyValue=get_value,
+            getProperties=lambda category, pin_prop=pin_prop: [pin_prop],
+        )
+        pins[output_id] = pin
+        nodes.append(pin)
+        return {"node_id": output_id}
+
+    graph = SimpleNamespace(
+        getUID=lambda: "graph-A",
+        getNodes=lambda: nodes,
+        getOutputNodes=lambda: [node for node in nodes if node.getIdentifier() in pins],
+        getOutputIdentifiers=lambda: [],
+    )
+    monkeypatch.setattr(api, "active_graph", lambda: graph)
+    monkeypatch.setattr(api, "add_output", add_output)
+    monkeypatch.setattr(api, "connect_nodes", lambda *args, **kwargs: {})
+    monkeypatch.setattr(api, "remove_created", lambda created: cleaned.extend(created))
+    monkeypatch.setattr(evaluation, "evaluate_graph", lambda *args: {})
+
+    destination = tmp_path / "maps"
+    result = evaluation.export_native_maps(
+        str(destination),
+        [
+            {"name": "first", "node_id": "mid0", "property": "unique_filter_output"},
+            {"name": "second", "node_id": "mid1", "property": "unique_filter_output"},
+        ],
+        "graph-A",
+    )
+    assert created_ids == ["mcp_pin_first", "mcp_pin_second"]
+    assert result["pinned_intermediates"] == 2
+    hashes = [item["sha256"] for item in result["files"]]
+    assert hashes[0] != hashes[1]
+    assert cleaned == ["mcp_pin_first", "mcp_pin_second"]
 
 
 def test_pin_failure_still_removes_temporary_outputs(monkeypatch, tmp_path):
@@ -207,10 +301,17 @@ def test_pin_failure_still_removes_temporary_outputs(monkeypatch, tmp_path):
     graph = SimpleNamespace(
         getUID=lambda: "graph-A",
         getNodes=lambda: nodes,
-        getOutputNodes=lambda: [node for node in nodes if node.getIdentifier() == "pin"],
+        getOutputNodes=lambda: [node for node in nodes if node.getIdentifier() == "mcp_pin_warped"],
+        getOutputIdentifiers=lambda: [],
     )
     monkeypatch.setattr(api, "active_graph", lambda: graph)
-    monkeypatch.setattr(api, "create_node", lambda *args, **kwargs: nodes.append(pin) or {"node_id": "pin"})
+
+    def add_output(output_id, position=None):
+        pin.getIdentifier = lambda: output_id
+        nodes.append(pin)
+        return {"node_id": output_id}
+
+    monkeypatch.setattr(api, "add_output", add_output)
     monkeypatch.setattr(api, "connect_nodes", lambda *args, **kwargs: {})
     monkeypatch.setattr(api, "remove_created", lambda created: cleaned.extend(created))
     monkeypatch.setattr(evaluation, "evaluate_graph", lambda *args: {})
@@ -222,5 +323,5 @@ def test_pin_failure_still_removes_temporary_outputs(monkeypatch, tmp_path):
             "graph-A",
         )
     assert error.value.code == "OUTPUT_NOT_COMPUTED"
-    assert cleaned == ["pin"]
+    assert cleaned == ["mcp_pin_warped"]
     assert not (tmp_path / "maps").exists()
