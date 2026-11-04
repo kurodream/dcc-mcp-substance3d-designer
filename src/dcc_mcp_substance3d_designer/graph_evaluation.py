@@ -14,6 +14,53 @@ from .graph_inspection import checked_graph, graph_identity
 from .image_metadata import read_image_metadata
 from .render_process import run_renderer
 
+_OUTPUT_INPUT = "inputNodeOutput"
+
+
+def _graph_output_ids(graph: Any) -> set[str]:
+    return {api.node_identifier(node) for node in api.items(graph.getOutputNodes())}
+
+
+def _pin_intermediates_for_export(
+    graph: Any, selected: list[tuple[str, Any, Any]], expected_graph_uid: str
+) -> tuple[list[tuple[str, str, str, Any, Any]], list[str]]:
+    """Pin non-output selections to temporary graph outputs so compute retains textures.
+
+    Returns resolved rows ``(name, source_node_id, source_property, read_node, read_prop)``
+    and created temp output node ids for rollback.
+    """
+    from sd.api.sdproperty import SDPropertyCategory
+
+    from .graph_inspection import find_in_graph
+
+    output_ids = _graph_output_ids(graph)
+    resolved: list[tuple[str, str, str, Any, Any]] = []
+    created: list[str] = []
+    try:
+        for name, node, prop in selected:
+            source_id = api.node_identifier(node)
+            source_property = prop.getId()
+            if source_id in output_ids:
+                resolved.append((name, source_id, source_property, node, prop))
+                continue
+            temp = api.create_node("sbs::compositing::output")
+            temp_id = temp["node_id"]
+            created.append(temp_id)
+            api.connect_nodes(source_id, source_property, temp_id, _OUTPUT_INPUT, expected_graph_uid)
+            graph = checked_graph(expected_graph_uid)
+            pinned = find_in_graph(graph, temp_id)
+            ports = api.items(pinned.getProperties(SDPropertyCategory.Output))
+            if not ports:
+                raise api.GraphAuthoringError(
+                    f"Temporary output for {name} has no output property", "OUTPUT_NOT_COMPUTED"
+                )
+            resolved.append((name, source_id, source_property, pinned, ports[0]))
+            output_ids.add(temp_id)
+        return resolved, created
+    except BaseException:
+        api.remove_created(created)
+        raise
+
 
 def export_native_maps(
     output_dir: str, outputs: list[dict], expected_graph_uid: str, max_resolution: int = 2048
@@ -45,60 +92,68 @@ def export_native_maps(
     destination = Path(output_dir).expanduser().resolve()
     if destination.exists() or destination.is_symlink():
         raise api.GraphAuthoringError("Use a fresh output directory", "OUTPUT_EXISTS")
-    evaluate_graph(expected_graph_uid, 128, max_resolution)
-    textures = []
-    for name, node, prop in selected:
-        wrapped = node.getPropertyValue(prop)
-        texture = wrapped.get() if wrapped else None
-        if texture is None:
-            raise api.GraphAuthoringError(
-                f"Output {name} ({api.node_identifier(node)}.{prop.getId()}) did not compute. "
-                "Select the graph output node when an intermediate texture is unavailable.",
-                "OUTPUT_NOT_COMPUTED",
-            )
-        size = texture.getSize()
-        if not 0 < size.x <= max_resolution or not 0 < size.y <= max_resolution:
-            raise api.GraphAuthoringError("Texture exceeds the resolution budget", "RESOLUTION_LIMIT")
-        textures.append((name, node, prop, texture, size))
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    files = []
-    # Validate all files in owned storage before publishing the directory.
-    with tempfile.TemporaryDirectory(prefix=".designer-maps-", dir=destination.parent) as temporary:
-        staging = Path(temporary) / "maps"
-        staging.mkdir()
-        for name, node, prop, texture, size in textures:
-            path = staging / (name + ".png")
-            if texture.save(str(path)) is False or not path.is_file() or not path.stat().st_size:
-                raise api.GraphAuthoringError(f"SDK did not save output {name}", "MAP_OUTPUT_MISSING")
-            metadata = read_image_metadata(path, "png", None)
-            if (metadata["width"], metadata["height"]) != (size.x, size.y):
+    created: list[str] = []
+    try:
+        resolved, created = _pin_intermediates_for_export(graph, selected, expected_graph_uid)
+        # Temp outputs increase node count; keep the same evaluation budget as before.
+        evaluate_graph(expected_graph_uid, 128 + len(created), max_resolution)
+        textures = []
+        for name, source_id, source_property, read_node, read_prop in resolved:
+            wrapped = read_node.getPropertyValue(read_prop)
+            texture = wrapped.get() if wrapped else None
+            if texture is None:
                 raise api.GraphAuthoringError(
-                    f"Saved output {name} dimensions do not match SDK readback", "MAP_HEADER_INVALID"
+                    f"Output {name} ({source_id}.{source_property}) did not compute after pinning "
+                    "a temporary graph output. Check that the source node evaluates and that "
+                    "Absolute $outputsize stays within the resolution budget.",
+                    "OUTPUT_NOT_COMPUTED",
                 )
-            digest = hashlib.sha256()
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            pixel_format = texture.getPixelFormat()
-            files.append(
-                {
-                    "name": name,
-                    "node_id": api.node_identifier(node),
-                    "property": prop.getId(),
-                    "pixel_format": str(getattr(pixel_format, "name", pixel_format)),
-                    "path": str(destination / path.name),
-                    "sha256": digest.hexdigest(),
-                    "image_metadata": metadata,
-                }
-            )
-        if destination.exists() or destination.is_symlink():
-            raise api.GraphAuthoringError("Use a fresh output directory", "OUTPUT_EXISTS")
-        staging.rename(destination)
-    return {
-        "graph_uid": expected_graph_uid,
-        "files": files,
-        "precision_policy": "native SDK texture precision; no inferred height precision",
-    }
+            size = texture.getSize()
+            if not 0 < size.x <= max_resolution or not 0 < size.y <= max_resolution:
+                raise api.GraphAuthoringError("Texture exceeds the resolution budget", "RESOLUTION_LIMIT")
+            textures.append((name, source_id, source_property, texture, size))
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        files = []
+        # Validate all files in owned storage before publishing the directory.
+        with tempfile.TemporaryDirectory(prefix=".designer-maps-", dir=destination.parent) as temporary:
+            staging = Path(temporary) / "maps"
+            staging.mkdir()
+            for name, source_id, source_property, texture, size in textures:
+                path = staging / (name + ".png")
+                if texture.save(str(path)) is False or not path.is_file() or not path.stat().st_size:
+                    raise api.GraphAuthoringError(f"SDK did not save output {name}", "MAP_OUTPUT_MISSING")
+                metadata = read_image_metadata(path, "png", None)
+                if (metadata["width"], metadata["height"]) != (size.x, size.y):
+                    raise api.GraphAuthoringError(
+                        f"Saved output {name} dimensions do not match SDK readback", "MAP_HEADER_INVALID"
+                    )
+                digest = hashlib.sha256()
+                with path.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                pixel_format = texture.getPixelFormat()
+                files.append(
+                    {
+                        "name": name,
+                        "node_id": source_id,
+                        "property": source_property,
+                        "pixel_format": str(getattr(pixel_format, "name", pixel_format)),
+                        "path": str(destination / path.name),
+                        "sha256": digest.hexdigest(),
+                        "image_metadata": metadata,
+                    }
+                )
+            if destination.exists() or destination.is_symlink():
+                raise api.GraphAuthoringError("Use a fresh output directory", "OUTPUT_EXISTS")
+            staging.rename(destination)
+        return {
+            "graph_uid": expected_graph_uid,
+            "files": files,
+            "precision_policy": "native SDK texture precision; no inferred height precision",
+            "pinned_intermediates": len(created),
+        }
+    finally:
+        api.remove_created(created)
 
 
 def validate_resolution_budget(graph: Any, max_resolution: int) -> None:
